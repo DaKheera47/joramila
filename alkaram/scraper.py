@@ -16,7 +16,7 @@ from curl_cffi import requests
 
 from .database import DATABASE_PATH, ProductDatabase
 from .embeddings import ProductEmbedder
-from .models import Product
+from .models import Product, ProductImage
 
 
 BASE_URL = "https://us.alkaramstudio.com/"
@@ -29,7 +29,7 @@ class AlkaramScraper:
 	def __init__(self, base_url: str = BASE_URL, brand: str = "Alkaram Studio") -> None:
 		self.base_url = base_url.rstrip("/") + "/"
 		self.brand = brand
-		self.embedder = ProductEmbedder()
+		self.embedder = ProductEmbedder(project_root=PROJECT_ROOT)
 		self._thread_local = threading.local()
 		self._base_headers = {
 			"User-Agent": (
@@ -79,10 +79,15 @@ class AlkaramScraper:
 
 					try:
 						product = future.result()
+						product.text_embedding = self.embedder.embed_product_text(product)
+						image_embeddings = self.embedder.embed_product_images(product)
+						for image, embedding in zip(product.images, image_embeddings):
+							image.embedding = embedding
+						product.images = [image for image in product.images if image.embedding]
 						database.upsert_product(product)
 						processed += 1
 						status = (
-							f"saved id={product.id} images={len(product.local_image_urls)} "
+							f"saved id={product.id} image_embeddings={len(product.images)} "
 							f"category={product.category or 'unknown'} "
 							f"stitched={product.stitched_status or 'unknown'}"
 						)
@@ -123,25 +128,36 @@ class AlkaramScraper:
 		seller = self._text_value(product_data.get("vendor")) or self.brand
 		price = self._extract_price(product_data, soup)
 		currency = self._extract_currency(soup)
+		product_id = self._extract_product_id(product_data, product_url)
 		image_urls = self.extract_product_images(product_url, soup=soup, product_data=product_data)
 		local_image_urls = self.download_image_urls(handle, image_urls, output_dir=output_dir)
 		category = self._derive_category(handle, title)
 		stitched_status = self._derive_stitched_status(handle, title)
+		images = [
+			ProductImage(
+				id=f"{product_id}:{index:02d}",
+				product_id=product_id,
+				image_url=image_url,
+				local_image_url=local_image_url,
+				sort_order=index,
+			)
+			for index, (image_url, local_image_url) in enumerate(zip(image_urls, local_image_urls), start=1)
+		]
 
 		product = Product(
-			id=self._extract_product_id(product_data, product_url),
+			id=product_id,
 			title=title.strip(),
 			brand=self.brand,
 			seller=seller,
 			product_url=product_url,
 			image_urls=image_urls,
 			local_image_urls=local_image_urls,
+			images=images,
 			price=price,
 			currency=currency,
 			category=category,
 			stitched_status=stitched_status,
 		)
-		product.embedding = self.embedder.embed_product(product)
 		return product
 
 	def fetch(self, url: str) -> str:
@@ -257,7 +273,13 @@ class AlkaramScraper:
 			for future in as_completed(futures):
 				index = futures[future]
 				try:
-					products_by_index[index] = future.result()
+					product = future.result()
+					product.text_embedding = self.embedder.embed_product_text(product)
+					image_embeddings = self.embedder.embed_product_images(product)
+					for image, embedding in zip(product.images, image_embeddings):
+						image.embedding = embedding
+					product.images = [image for image in product.images if image.embedding]
+					products_by_index[index] = product
 				except Exception:
 					continue
 		return [products_by_index[index] for index in sorted(products_by_index)]
@@ -277,7 +299,17 @@ class AlkaramScraper:
 					"currency": product.currency,
 					"category": product.category,
 					"stitchedStatus": product.stitched_status,
-					"embedding": product.embedding,
+					"textEmbedding": product.text_embedding,
+					"images": [
+						{
+							"id": image.id,
+							"imageUrl": image.image_url,
+							"localImageUrl": image.local_image_url,
+							"sortOrder": image.sort_order,
+							"embedding": image.embedding,
+						}
+						for image in product.images
+					],
 				}
 				for product in self.scrape(limit=limit, max_workers=max_workers)
 			],

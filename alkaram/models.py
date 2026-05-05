@@ -5,6 +5,16 @@ from typing import Optional
 
 
 @dataclass
+class ProductImage:
+	id: str
+	product_id: int
+	image_url: str
+	local_image_url: str
+	sort_order: int
+	embedding: list[float] = field(default_factory=list)
+
+
+@dataclass
 class Product:
 	id: int
 	title: str
@@ -13,8 +23,9 @@ class Product:
 	product_url: str
 	image_urls: list[str] = field(default_factory=list)
 	local_image_urls: list[str] = field(default_factory=list)
+	images: list[ProductImage] = field(default_factory=list)
 	price: Optional[float] = None
 	currency: Optional[str] = None
 	category: Optional[str] = None
 	stitched_status: Optional[str] = None
-	embedding: list[float] = field(default_factory=list)
+	text_embedding: list[float] = field(default_factory=list)

@@ -38,3 +38,5 @@ alkaram/images/
 alkaram/*.db
 alkaram/*.sqlite
 alkaram/*.sqlite3
+alkaram/*.sqlite3-shm
+alkaram/*.sqlite3-wal

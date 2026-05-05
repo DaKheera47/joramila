@@ -4,7 +4,6 @@ import json
 import sqlite3
 from pathlib import Path
 
-from .embeddings import EMBEDDING_DIMENSIONS
 from .models import Product
 
 
@@ -12,7 +11,7 @@ DATABASE_PATH = Path(__file__).resolve().parent / "products.sqlite3"
 
 
 class ProductDatabase:
-	def __init__(self, db_path: Path = DATABASE_PATH, embedding_dimensions: int = EMBEDDING_DIMENSIONS) -> None:
+	def __init__(self, db_path: Path = DATABASE_PATH, embedding_dimensions: int = 512) -> None:
 		self.db_path = Path(db_path)
 		self.embedding_dimensions = embedding_dimensions
 		self.connection = self._connect()
@@ -20,6 +19,71 @@ class ProductDatabase:
 
 	def close(self) -> None:
 		self.connection.close()
+
+	def search_similar_products_by_image(
+		self,
+		embedding: list[float],
+		limit: int = 25,
+		per_product_limit: int = 4,
+	) -> list[dict]:
+		rows = self.connection.execute(
+			"""
+			SELECT
+				pie.image_id,
+				pie.product_id,
+				pie.sort_order,
+				pie.distance,
+				p.title,
+				p.brand,
+				p.seller,
+				p.product_url,
+				p.local_image_urls,
+				p.price,
+				p.currency,
+				p.category,
+				p.stitched_status
+			FROM product_image_embeddings AS pie
+			JOIN products AS p ON p.id = pie.product_id
+			WHERE pie.embedding MATCH ?
+			  AND k = ?
+			ORDER BY pie.distance
+			""",
+			(json.dumps(embedding), limit),
+		).fetchall()
+
+		grouped: dict[int, dict] = {}
+		for row in rows:
+			product_id = row[1]
+			product = grouped.setdefault(
+				product_id,
+				{
+					"productId": product_id,
+					"title": row[4],
+					"brand": row[5],
+					"seller": row[6],
+					"productUrl": row[7],
+					"localImagesUrl": json.loads(row[8]),
+					"price": row[9],
+					"currency": row[10],
+					"category": row[11],
+					"stitchedStatus": row[12],
+					"matches": [],
+				},
+			)
+			if len(product["matches"]) >= per_product_limit:
+				continue
+			product["matches"].append(
+				{
+					"imageId": row[0],
+					"sortOrder": row[2],
+					"distance": row[3],
+				}
+			)
+
+		return sorted(
+			grouped.values(),
+			key=lambda product: min(match["distance"] for match in product["matches"]),
+		)
 
 	def upsert_product(self, product: Product) -> None:
 		self.connection.execute(
@@ -35,9 +99,10 @@ class ProductDatabase:
 				price,
 				currency,
 				category,
-				stitched_status
+				stitched_status,
+				text_embedding
 			)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(id) DO UPDATE SET
 				title = excluded.title,
 				brand = excluded.brand,
@@ -49,6 +114,7 @@ class ProductDatabase:
 				currency = excluded.currency,
 				category = excluded.category,
 				stitched_status = excluded.stitched_status,
+				text_embedding = excluded.text_embedding,
 				updated_at = CURRENT_TIMESTAMP
 			""",
 			(
@@ -63,13 +129,54 @@ class ProductDatabase:
 				product.currency,
 				product.category,
 				product.stitched_status,
+				json.dumps(product.text_embedding),
 			),
 		)
-		self.connection.execute("DELETE FROM product_embeddings WHERE product_id = ?", (product.id,))
+
+		self.connection.execute("DELETE FROM product_images WHERE product_id = ?", (product.id,))
 		self.connection.execute(
-			"INSERT INTO product_embeddings (product_id, embedding) VALUES (?, ?)",
-			(product.id, json.dumps(product.embedding)),
+			"DELETE FROM product_image_embeddings WHERE product_id = ?",
+			(product.id,),
 		)
+
+		for image in product.images:
+			self.connection.execute(
+				"""
+				INSERT INTO product_images (
+					id,
+					product_id,
+					image_url,
+					local_image_url,
+					sort_order
+				)
+				VALUES (?, ?, ?, ?, ?)
+				""",
+				(
+					image.id,
+					image.product_id,
+					image.image_url,
+					image.local_image_url,
+					image.sort_order,
+				),
+			)
+			self.connection.execute(
+				"""
+				INSERT INTO product_image_embeddings (
+					image_id,
+					product_id,
+					sort_order,
+					embedding
+				)
+				VALUES (?, ?, ?, ?)
+				""",
+				(
+					image.id,
+					image.product_id,
+					image.sort_order,
+					json.dumps(image.embedding),
+				),
+			)
+
 		self.connection.commit()
 
 	def _connect(self) -> sqlite3.Connection:
@@ -102,23 +209,52 @@ class ProductDatabase:
 				currency TEXT,
 				category TEXT,
 				stitched_status TEXT,
+				text_embedding TEXT NOT NULL,
 				updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 			)
 			"""
 		)
 		self.connection.execute(
-			f"""
-			CREATE VIRTUAL TABLE IF NOT EXISTS product_embeddings
-			USING vec0(
-				product_id INTEGER PRIMARY KEY,
-				embedding FLOAT[{self.embedding_dimensions}]
+			"""
+			CREATE TABLE IF NOT EXISTS product_images (
+				id TEXT PRIMARY KEY,
+				product_id INTEGER NOT NULL,
+				image_url TEXT NOT NULL,
+				local_image_url TEXT NOT NULL,
+				sort_order INTEGER NOT NULL,
+				FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
 			)
 			"""
 		)
+		self._ensure_image_embeddings_table()
 		self.connection.execute(
 			"CREATE INDEX IF NOT EXISTS idx_products_category ON products(category)"
 		)
 		self.connection.execute(
 			"CREATE INDEX IF NOT EXISTS idx_products_stitched_status ON products(stitched_status)"
 		)
+		self.connection.execute(
+			"CREATE INDEX IF NOT EXISTS idx_product_images_product_id ON product_images(product_id)"
+		)
 		self.connection.commit()
+
+	def _ensure_image_embeddings_table(self) -> None:
+		row = self.connection.execute(
+			"SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'product_image_embeddings'"
+		).fetchone()
+		expected_signature = f"FLOAT[{self.embedding_dimensions}]"
+		if row and row[0] and expected_signature in row[0]:
+			return
+		if row:
+			self.connection.execute("DROP TABLE product_image_embeddings")
+		self.connection.execute(
+			f"""
+			CREATE VIRTUAL TABLE product_image_embeddings
+			USING vec0(
+				image_id TEXT PRIMARY KEY,
+				product_id INTEGER,
+				sort_order INTEGER,
+				embedding FLOAT[{self.embedding_dimensions}]
+			)
+			"""
+		)
