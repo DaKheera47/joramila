@@ -85,6 +85,7 @@ uv run uvicorn alkaram.webui:app --reload --port 8069
 - Image files may be reused if they already exist locally.
 - Re-imports should skip unchanged products when the stored content hash and image embedding counts still match.
 - Query-time images should go through the same preprocessing path as indexed product images.
+- If macOS foreground extraction finds no subject, preprocessing should fall back to plain WebP conversion instead of failing the request.
 - Database writes should remain deterministic and idempotent where practical.
 - Keep the web UI intentionally small unless the user asks for a richer product.
 

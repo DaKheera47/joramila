@@ -65,8 +65,18 @@ class ProductImagePreprocessor:
 		self._ensure_background_remover_binary()
 		with tempfile.TemporaryDirectory(prefix="joramila-bg-") as tmp_dir:
 			mask_png = Path(tmp_dir) / f"{source_path.stem}.png"
-			self._run_background_removal(source_path, mask_png)
-			with Image.open(mask_png) as image:
+			try:
+				self._run_background_removal(source_path, mask_png)
+				render_source = mask_png
+			except RuntimeError as exc:
+				# Some images do not have a cleanly detectable foreground subject.
+				# In that case we still want a deterministic processed asset, so
+				# fall back to a plain WebP conversion of the original image.
+				if not self._is_no_mask_error(exc):
+					raise
+				render_source = source_path
+
+			with Image.open(render_source) as image:
 				image.convert("RGBA").save(destination, format="WEBP", quality=85, method=6)
 
 	def _ensure_background_remover_binary(self) -> None:
@@ -101,6 +111,11 @@ class ProductImagePreprocessor:
 			raise RuntimeError(
 				f"background removal failed for {source_path.name}: {result.stderr.strip() or result.stdout.strip()}"
 			)
+
+	@staticmethod
+	def _is_no_mask_error(error: RuntimeError) -> bool:
+		message = str(error)
+		return "RemoveBackgroundError.noMask" in message
 
 	def _absolute_path(self, image_path: str | Path) -> Path:
 		path = Path(image_path)
