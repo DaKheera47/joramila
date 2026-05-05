@@ -1,38 +1,35 @@
 from __future__ import annotations
 
+import hashlib
 import json
-import mimetypes
 import re
+import threading
 import time
 import xml.etree.ElementTree as ET
-from dataclasses import asdict, dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import threading
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 from bs4 import BeautifulSoup
 from curl_cffi import requests
 
+from .database import DATABASE_PATH, ProductDatabase
+from .embeddings import ProductEmbedder
+from .models import Product
+
 
 BASE_URL = "https://us.alkaramstudio.com/"
 SITEMAP_URL = "https://us.alkaramstudio.com/sitemap_products_1.xml?from=8053676605722&to=10218512646426"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 IMAGE_OUTPUT_DIR = Path(__file__).resolve().parent / "images"
 
 
-@dataclass
-class Product:
-	title: str
-	url: str
-	price: Optional[str] = None
-	image: Optional[str] = None
-	images: list[str] = field(default_factory=list)
-
-
 class AlkaramScraper:
-	def __init__(self, base_url: str = BASE_URL) -> None:
+	def __init__(self, base_url: str = BASE_URL, brand: str = "Alkaram Studio") -> None:
 		self.base_url = base_url.rstrip("/") + "/"
+		self.brand = brand
+		self.embedder = ProductEmbedder()
 		self._thread_local = threading.local()
 		self._base_headers = {
 			"User-Agent": (
@@ -47,13 +44,105 @@ class AlkaramScraper:
 			"Referer": self.base_url,
 		}
 
-	def _session(self) -> requests.Session:
-		session = getattr(self._thread_local, "session", None)
-		if session is None:
-			session = requests.Session()
-			session.headers.update(self._base_headers)
-			self._thread_local.session = session
-		return session
+	def ingest_products(
+		self,
+		db_path: Path = DATABASE_PATH,
+		output_dir: Path = IMAGE_OUTPUT_DIR,
+		max_workers: int = 8,
+		limit: Optional[int] = None,
+	) -> int:
+		product_urls = self.fetch_sitemap_product_links()
+		if limit is not None:
+			product_urls = product_urls[: max(0, limit)]
+		if not product_urls:
+			return 0
+
+		worker_count = max(1, min(max_workers, len(product_urls)))
+		processed = 0
+		start_time = time.monotonic()
+		total = len(product_urls)
+		database = ProductDatabase(db_path=db_path, embedding_dimensions=self.embedder.dimensions)
+
+		try:
+			with ThreadPoolExecutor(max_workers=worker_count) as executor:
+				futures = {
+					executor.submit(self.build_product, product_url, output_dir): product_url
+					for product_url in product_urls
+				}
+				for completed, future in enumerate(as_completed(futures), start=1):
+					product_url = futures[future]
+					elapsed = max(time.monotonic() - start_time, 0.001)
+					avg_seconds = elapsed / completed
+					remaining = total - completed
+					eta_seconds = avg_seconds * remaining
+					per_second = completed / elapsed
+
+					try:
+						product = future.result()
+						database.upsert_product(product)
+						processed += 1
+						status = (
+							f"saved id={product.id} images={len(product.local_image_urls)} "
+							f"category={product.category or 'unknown'} "
+							f"stitched={product.stitched_status or 'unknown'}"
+						)
+					except Exception as exc:
+						status = f"failed: {exc.__class__.__name__}"
+
+					print(
+						(
+							f"[{completed}/{total}] left={remaining} "
+							f"eta={self._format_duration(eta_seconds)} "
+							f"avg={self._format_duration(avg_seconds)} "
+							f"rate={per_second:.2f}/s "
+							f"{status} {product_url}"
+						)
+					)
+		finally:
+			database.close()
+
+		return processed
+
+	def build_product(self, product_url: str, output_dir: Path = IMAGE_OUTPUT_DIR) -> Product:
+		soup = self.soup(product_url)
+
+		try:
+			product_data = self.fetch_product_json(product_url)
+		except Exception:
+			product_data = {}
+
+		title = (
+			self._text_value(product_data.get("title"))
+			or self._first_text(
+				soup,
+				["h1", "[data-product-title]", ".product__title", ".product-title", "meta[property='og:title']"],
+			)
+			or product_url.rsplit("/", 1)[-1].replace("-", " ").strip()
+		)
+		handle = self._text_value(product_data.get("handle")) or product_url.rstrip("/").rsplit("/", 1)[-1]
+		seller = self._text_value(product_data.get("vendor")) or self.brand
+		price = self._extract_price(product_data, soup)
+		currency = self._extract_currency(soup)
+		image_urls = self.extract_product_images(product_url, soup=soup, product_data=product_data)
+		local_image_urls = self.download_image_urls(handle, image_urls, output_dir=output_dir)
+		category = self._derive_category(handle, title)
+		stitched_status = self._derive_stitched_status(handle, title)
+
+		product = Product(
+			id=self._extract_product_id(product_data, product_url),
+			title=title.strip(),
+			brand=self.brand,
+			seller=seller,
+			product_url=product_url,
+			image_urls=image_urls,
+			local_image_urls=local_image_urls,
+			price=price,
+			currency=currency,
+			category=category,
+			stitched_status=stitched_status,
+		)
+		product.embedding = self.embedder.embed_product(product)
+		return product
 
 	def fetch(self, url: str) -> str:
 		response = self._session().get(url, impersonate="chrome124", timeout=30)
@@ -62,9 +151,6 @@ class AlkaramScraper:
 
 	def soup(self, url: str) -> BeautifulSoup:
 		return BeautifulSoup(self.fetch(url), "html.parser")
-
-	def homepage(self) -> BeautifulSoup:
-		return self.soup(self.base_url)
 
 	def fetch_sitemap_product_links(self, sitemap_url: str = SITEMAP_URL) -> list[str]:
 		response = self._session().get(sitemap_url, impersonate="chrome124", timeout=30)
@@ -83,82 +169,26 @@ class AlkaramScraper:
 				links.append(product_url)
 		return links
 
-	def fetch_product_json(self, product_url: str) -> dict:
+	def fetch_product_json(self, product_url: str) -> dict[str, Any]:
 		json_url = self._product_json_url(product_url)
 		response = self._session().get(json_url, impersonate="chrome124", timeout=30)
 		response.raise_for_status()
 		return response.json()
 
-	def extract_category_links(self) -> list[str]:
-		soup = self.homepage()
-		links: list[str] = []
-		seen: set[str] = set()
-
-		for a in soup.select("a[href]"):
-			href = (a.get("href") or "").strip()
-			if not href:
-				continue
-			absolute = urljoin(self.base_url, href)
-			if self.base_url not in absolute:
-				continue
-			if any(skip in absolute for skip in ("/account", "/cart", "/checkout", "/search")):
-				continue
-			if absolute not in seen:
-				seen.add(absolute)
-				links.append(absolute)
-		return links
-
-	def extract_product_links(self, category_url: str) -> list[str]:
-		soup = self.soup(category_url)
-		links: list[str] = []
-		seen: set[str] = set()
-
-		for a in soup.select("a[href]"):
-			href = (a.get("href") or "").strip()
-			if not href:
-				continue
-			absolute = urljoin(category_url, href).split("?")[0].rstrip("/")
-			if "/products/" in absolute or "/product/" in absolute:
-				if absolute not in seen:
-					seen.add(absolute)
-					links.append(absolute)
-		return links
-
-	def parse_product(self, product_url: str) -> Product:
-		soup = self.soup(product_url)
-
-		title = self._first_text(
-			soup,
-			["h1", "[data-product-title]", ".product__title", ".product-title", "meta[property='og:title']"],
-		) or product_url.rsplit("/", 1)[-1].replace("-", " ").strip()
-
-		price = self._first_text(
-			soup,
-			[
-				"[class*='price']",
-				"[data-product-price]",
-				"meta[property='product:price:amount']",
-			],
-		)
-		meta_price = soup.select_one("meta[property='product:price:amount']")
-		if meta_price and meta_price.get("content"):
-			price = meta_price.get("content")
-
-		image = self._first_attr(
-			soup,
-			["meta[property='og:image']", "[data-product-image]", ".product__media img", "img"],
-			"content",
-		) or self._first_attr(soup, [".product__media img", "img"], "src")
-
-		images = self.extract_product_images(product_url, soup=soup)
-		if not image and images:
-			image = images[0]
-
-		return Product(title=title.strip(), url=product_url, price=price, image=image, images=images)
-
-	def extract_product_images(self, product_url: str, soup: Optional[BeautifulSoup] = None) -> list[str]:
+	def extract_product_images(
+		self,
+		product_url: str,
+		soup: Optional[BeautifulSoup] = None,
+		product_data: Optional[dict[str, Any]] = None,
+	) -> list[str]:
 		if soup is None:
 			soup = self.soup(product_url)
+		if product_data is None:
+			try:
+				product_data = self.fetch_product_json(product_url)
+			except Exception:
+				product_data = {}
+
 		images: list[str] = []
 		seen: set[str] = set()
 
@@ -168,11 +198,6 @@ class AlkaramScraper:
 				return
 			seen.add(normalized)
 			images.append(normalized)
-
-		try:
-			product_data = self.fetch_product_json(product_url)
-		except Exception:
-			product_data = {}
 
 		for raw_url in product_data.get("images", []) if isinstance(product_data, dict) else []:
 			add(raw_url)
@@ -196,77 +221,26 @@ class AlkaramScraper:
 
 		return images
 
-	def download_product_images(self, product_url: str, output_dir: Path = IMAGE_OUTPUT_DIR) -> list[Path]:
-		product = self.parse_product(product_url)
+	def download_image_urls(self, handle: str, image_urls: list[str], output_dir: Path = IMAGE_OUTPUT_DIR) -> list[str]:
 		output_dir.mkdir(parents=True, exist_ok=True)
 
-		downloaded: list[Path] = []
-		slug = self._slugify(product.url.rstrip("/").rsplit("/", 1)[-1]) or self._slugify(product.title)
-
-		for index, image_url in enumerate(product.images, start=1):
+		local_paths: list[str] = []
+		slug = self._slugify(handle)
+		for index, image_url in enumerate(image_urls, start=1):
 			extension = self._image_extension(image_url)
 			destination = output_dir / f"{slug}-{index:02d}{extension}"
-			if destination.exists() and destination.stat().st_size > 0:
-				downloaded.append(destination)
-				continue
+			if not destination.exists() or destination.stat().st_size <= 0:
+				response = self._session().get(image_url, impersonate="chrome124", timeout=60)
+				response.raise_for_status()
+				destination.write_bytes(response.content)
 
-			response = self._session().get(image_url, impersonate="chrome124", timeout=60)
-			response.raise_for_status()
-			if not extension:
-				destination = destination.with_suffix(
-					self._content_type_extension(response.headers.get("Content-Type", ""))
-				)
-			destination.write_bytes(response.content)
-			downloaded.append(destination)
+			try:
+				relative_path = destination.relative_to(PROJECT_ROOT)
+			except ValueError:
+				relative_path = destination
+			local_paths.append(relative_path.as_posix())
 
-		return downloaded
-
-	def download_all_images(
-		self,
-		output_dir: Path = IMAGE_OUTPUT_DIR,
-		max_workers: int = 8,
-		limit: Optional[int] = None,
-	) -> list[Path]:
-		product_urls = self.fetch_sitemap_product_links()
-		if limit is not None:
-			product_urls = product_urls[: max(0, limit)]
-		if not product_urls:
-			return []
-
-		worker_count = max(1, min(max_workers, len(product_urls)))
-		downloaded: list[Path] = []
-		start_time = time.monotonic()
-		completed = 0
-		total = len(product_urls)
-		with ThreadPoolExecutor(max_workers=worker_count) as executor:
-			futures = {
-				executor.submit(self.download_product_images, product_url, output_dir): product_url
-				for product_url in product_urls
-			}
-			for future in as_completed(futures):
-				completed += 1
-				product_url = futures[future]
-				elapsed = max(time.monotonic() - start_time, 0.001)
-				avg_seconds = elapsed / completed
-				remaining = total - completed
-				eta_seconds = avg_seconds * remaining
-				per_second = completed / elapsed
-				try:
-					paths = future.result()
-					downloaded.extend(paths)
-					status = f"downloaded {len(paths)} images"
-				except Exception as exc:
-					status = f"failed: {exc.__class__.__name__}"
-				print(
-					(
-						f"[{completed}/{total}] left={remaining} "
-						f"eta={self._format_duration(eta_seconds)} "
-						f"avg={self._format_duration(avg_seconds)} "
-						f"rate={per_second:.2f}/s "
-						f"{status} {product_url}"
-					)
-				)
-		return downloaded
+		return local_paths
 
 	def scrape(self, limit: int = 20, max_workers: int = 8) -> list[Product]:
 		if limit <= 0:
@@ -277,7 +251,7 @@ class AlkaramScraper:
 		products_by_index: dict[int, Product] = {}
 		with ThreadPoolExecutor(max_workers=worker_count) as executor:
 			futures = {
-				executor.submit(self.parse_product, product_url): index
+				executor.submit(self.build_product, product_url, IMAGE_OUTPUT_DIR): index
 				for index, product_url in enumerate(product_urls)
 			}
 			for future in as_completed(futures):
@@ -290,10 +264,34 @@ class AlkaramScraper:
 
 	def scrape_json(self, limit: int = 20, max_workers: int = 8) -> str:
 		return json.dumps(
-			[asdict(p) for p in self.scrape(limit=limit, max_workers=max_workers)],
+			[
+				{
+					"id": product.id,
+					"title": product.title,
+					"brand": product.brand,
+					"seller": product.seller,
+					"productUrl": product.product_url,
+					"imagesUrl": product.image_urls,
+					"localImagesUrl": product.local_image_urls,
+					"price": product.price,
+					"currency": product.currency,
+					"category": product.category,
+					"stitchedStatus": product.stitched_status,
+					"embedding": product.embedding,
+				}
+				for product in self.scrape(limit=limit, max_workers=max_workers)
+			],
 			indent=2,
 			ensure_ascii=False,
 		)
+
+	def _session(self) -> requests.Session:
+		session = getattr(self._thread_local, "session", None)
+		if session is None:
+			session = requests.Session()
+			session.headers.update(self._base_headers)
+			self._thread_local.session = session
+		return session
 
 	@staticmethod
 	def _first_text(soup: BeautifulSoup, selectors: Iterable[str]) -> Optional[str]:
@@ -337,11 +335,9 @@ class AlkaramScraper:
 	def _product_json_url(product_url: str) -> str:
 		parsed = urlparse(product_url)
 		path = parsed.path.rstrip("/")
-		if path.endswith(".js"):
-			json_path = path
-		else:
-			json_path = f"{path}.js"
-		return urlunparse(parsed._replace(path=json_path, query="", fragment=""))
+		if not path.endswith(".js"):
+			path = f"{path}.js"
+		return urlunparse(parsed._replace(path=path, query="", fragment=""))
 
 	@staticmethod
 	def _best_srcset_url(srcset: Optional[str], base_url: str) -> Optional[str]:
@@ -378,14 +374,6 @@ class AlkaramScraper:
 		return ".jpg"
 
 	@staticmethod
-	def _content_type_extension(content_type: str) -> str:
-		mime_type = content_type.split(";", 1)[0].strip().lower()
-		if not mime_type:
-			return ".jpg"
-		extension = mimetypes.guess_extension(mime_type)
-		return extension or ".jpg"
-
-	@staticmethod
 	def _format_duration(seconds: float) -> str:
 		seconds = max(0, int(round(seconds)))
 		hours, remainder = divmod(seconds, 3600)
@@ -394,8 +382,86 @@ class AlkaramScraper:
 			return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 		return f"{minutes:02d}:{secs:02d}"
 
+	@staticmethod
+	def _text_value(value: Any) -> Optional[str]:
+		if isinstance(value, str):
+			stripped = value.strip()
+			return stripped or None
+		return None
+
+	@staticmethod
+	def _extract_product_id(product_data: dict[str, Any], product_url: str) -> int:
+		raw_id = product_data.get("id")
+		if isinstance(raw_id, int):
+			return raw_id
+		if isinstance(raw_id, str) and raw_id.isdigit():
+			return int(raw_id)
+		digest = hashlib.blake2b(product_url.encode("utf-8"), digest_size=8).digest()
+		return int.from_bytes(digest, "big") & 0x7FFF_FFFF_FFFF_FFFF
+
+	@staticmethod
+	def _extract_currency(soup: BeautifulSoup) -> str:
+		for selector in [
+			"meta[property='product:price:currency']",
+			"meta[property='og:price:currency']",
+			"meta[itemprop='priceCurrency']",
+		]:
+			node = soup.select_one(selector)
+			if node and node.get("content"):
+				return node["content"].strip().upper()
+		return "USD"
+
+	@staticmethod
+	def _extract_price(product_data: dict[str, Any], soup: BeautifulSoup) -> Optional[float]:
+		raw_price = product_data.get("price")
+		if isinstance(raw_price, (int, float)):
+			return round(float(raw_price) / 100.0, 2)
+		if isinstance(raw_price, str):
+			try:
+				numeric = float(raw_price)
+			except ValueError:
+				numeric = None
+			if numeric is not None:
+				return round(numeric / 100.0, 2) if raw_price.isdigit() else round(numeric, 2)
+
+		meta_price = soup.select_one("meta[property='product:price:amount']")
+		if meta_price and meta_price.get("content"):
+			try:
+				return round(float(meta_price["content"].strip()), 2)
+			except ValueError:
+				return None
+		return None
+
+	@staticmethod
+	def _derive_category(handle: str, title: str) -> str:
+		filename = f"{handle} {title}".lower().replace("-", " ")
+		category_rules = [
+			("bridal-ish", ("bridal", "wedding", "lehenga", "gharara", "baraat")),
+			("luxury pret", ("luxury pret", "luxury", "pret")),
+			("formal", ("formal", "velvet", "organza", "chiffon", "silk", "festive")),
+			("lawn", ("lawn", "cambric", "khaddar")),
+			("casual", ("casual", "kurti", "tunic", "top", "daily wear")),
+		]
+		for category, keywords in category_rules:
+			if any(keyword in filename for keyword in keywords):
+				return category
+		return "casual"
+
+	@staticmethod
+	def _derive_stitched_status(handle: str, title: str) -> str:
+		filename = f"{handle} {title}".lower().replace("-", " ")
+		if "made to order" in filename or "made-to-order" in filename or "mto" in filename:
+			return "made-to-order"
+		if "unstitched" in filename:
+			return "unstitched"
+		if re.search(r"\b[1-4]\s*pc\b", filename) or re.search(r"\b[1-4]\s*piece\b", filename):
+			return "stitched"
+		if any(keyword in filename for keyword in ("stitched", "rtw", "kurti", "ready to wear")):
+			return "stitched"
+		return "unstitched"
+
 
 if __name__ == "__main__":
 	scraper = AlkaramScraper()
-	paths = scraper.download_all_images()
-	print(f"Downloaded {len(paths)} images to {IMAGE_OUTPUT_DIR}")
+	count = scraper.ingest_products()
+	print(f"Ingested {count} products into {DATABASE_PATH}")
