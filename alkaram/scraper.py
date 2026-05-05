@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 import mimetypes
 import re
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 from pathlib import Path
 from typing import Iterable, Optional
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
@@ -30,24 +33,30 @@ class Product:
 class AlkaramScraper:
 	def __init__(self, base_url: str = BASE_URL) -> None:
 		self.base_url = base_url.rstrip("/") + "/"
-		self.session = requests.Session()
-		self.session.headers.update(
-			{
-				"User-Agent": (
-					"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-					"(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-				),
-				"Accept": (
-					"text/html,application/xhtml+xml,application/xml;q=0.9,"
-					"image/avif,image/webp,*/*;q=0.8"
-				),
-				"Accept-Language": "en-US,en;q=0.9",
-				"Referer": self.base_url,
-			}
-		)
+		self._thread_local = threading.local()
+		self._base_headers = {
+			"User-Agent": (
+				"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+				"(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+			),
+			"Accept": (
+				"text/html,application/xhtml+xml,application/xml;q=0.9,"
+				"image/avif,image/webp,*/*;q=0.8"
+			),
+			"Accept-Language": "en-US,en;q=0.9",
+			"Referer": self.base_url,
+		}
+
+	def _session(self) -> requests.Session:
+		session = getattr(self._thread_local, "session", None)
+		if session is None:
+			session = requests.Session()
+			session.headers.update(self._base_headers)
+			self._thread_local.session = session
+		return session
 
 	def fetch(self, url: str) -> str:
-		response = self.session.get(url, impersonate="chrome124", timeout=30)
+		response = self._session().get(url, impersonate="chrome124", timeout=30)
 		response.raise_for_status()
 		return response.text
 
@@ -58,7 +67,7 @@ class AlkaramScraper:
 		return self.soup(self.base_url)
 
 	def fetch_sitemap_product_links(self, sitemap_url: str = SITEMAP_URL) -> list[str]:
-		response = self.session.get(sitemap_url, impersonate="chrome124", timeout=30)
+		response = self._session().get(sitemap_url, impersonate="chrome124", timeout=30)
 		response.raise_for_status()
 
 		root = ET.fromstring(response.text)
@@ -76,7 +85,7 @@ class AlkaramScraper:
 
 	def fetch_product_json(self, product_url: str) -> dict:
 		json_url = self._product_json_url(product_url)
-		response = self.session.get(json_url, impersonate="chrome124", timeout=30)
+		response = self._session().get(json_url, impersonate="chrome124", timeout=30)
 		response.raise_for_status()
 		return response.json()
 
@@ -201,7 +210,7 @@ class AlkaramScraper:
 				downloaded.append(destination)
 				continue
 
-			response = self.session.get(image_url, impersonate="chrome124", timeout=60)
+			response = self._session().get(image_url, impersonate="chrome124", timeout=60)
 			response.raise_for_status()
 			if not extension:
 				destination = destination.with_suffix(
@@ -212,28 +221,72 @@ class AlkaramScraper:
 
 		return downloaded
 
-	def download_all_images(self, output_dir: Path = IMAGE_OUTPUT_DIR) -> list[Path]:
+	def download_all_images(self, output_dir: Path = IMAGE_OUTPUT_DIR, max_workers: int = 8) -> list[Path]:
+		product_urls = self.fetch_sitemap_product_links()
+		if not product_urls:
+			return []
+
+		worker_count = max(1, min(max_workers, len(product_urls)))
 		downloaded: list[Path] = []
-		for product_url in self.fetch_sitemap_product_links():
-			try:
-				downloaded.extend(self.download_product_images(product_url, output_dir=output_dir))
-			except Exception:
-				continue
+		start_time = time.monotonic()
+		completed = 0
+		total = len(product_urls)
+		with ThreadPoolExecutor(max_workers=worker_count) as executor:
+			futures = {
+				executor.submit(self.download_product_images, product_url, output_dir): product_url
+				for product_url in product_urls
+			}
+			for future in as_completed(futures):
+				completed += 1
+				product_url = futures[future]
+				elapsed = max(time.monotonic() - start_time, 0.001)
+				avg_seconds = elapsed / completed
+				remaining = total - completed
+				eta_seconds = avg_seconds * remaining
+				per_second = completed / elapsed
+				try:
+					paths = future.result()
+					downloaded.extend(paths)
+					status = f"downloaded {len(paths)} images"
+				except Exception as exc:
+					status = f"failed: {exc.__class__.__name__}"
+				print(
+					(
+						f"[{completed}/{total}] left={remaining} "
+						f"eta={self._format_duration(eta_seconds)} "
+						f"avg={self._format_duration(avg_seconds)} "
+						f"rate={per_second:.2f}/s "
+						f"{status} {product_url}"
+					)
+				)
 		return downloaded
 
-	def scrape(self, limit: int = 20) -> list[Product]:
-		products: list[Product] = []
-		for product_url in self.fetch_sitemap_product_links():
-			try:
-				products.append(self.parse_product(product_url))
-			except Exception:
-				continue
-			if len(products) >= limit:
-				return products
-		return products
+	def scrape(self, limit: int = 20, max_workers: int = 8) -> list[Product]:
+		if limit <= 0:
+			return []
 
-	def scrape_json(self, limit: int = 20) -> str:
-		return json.dumps([asdict(p) for p in self.scrape(limit=limit)], indent=2, ensure_ascii=False)
+		product_urls = self.fetch_sitemap_product_links()[:limit]
+		worker_count = max(1, min(max_workers, len(product_urls)))
+		products_by_index: dict[int, Product] = {}
+		with ThreadPoolExecutor(max_workers=worker_count) as executor:
+			futures = {
+				executor.submit(self.parse_product, product_url): index
+				for index, product_url in enumerate(product_urls)
+			}
+			for future in as_completed(futures):
+				index = futures[future]
+				try:
+					products_by_index[index] = future.result()
+				except Exception:
+					continue
+		return [products_by_index[index] for index in sorted(products_by_index)]
+
+	def scrape_json(self, limit: int = 20, max_workers: int = 8) -> str:
+		return json.dumps(
+			[asdict(p) for p in self.scrape(limit=limit, max_workers=max_workers)],
+			indent=2,
+			ensure_ascii=False,
+		)
 
 	@staticmethod
 	def _first_text(soup: BeautifulSoup, selectors: Iterable[str]) -> Optional[str]:
@@ -324,6 +377,15 @@ class AlkaramScraper:
 			return ".jpg"
 		extension = mimetypes.guess_extension(mime_type)
 		return extension or ".jpg"
+
+	@staticmethod
+	def _format_duration(seconds: float) -> str:
+		seconds = max(0, int(round(seconds)))
+		hours, remainder = divmod(seconds, 3600)
+		minutes, secs = divmod(remainder, 60)
+		if hours:
+			return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+		return f"{minutes:02d}:{secs:02d}"
 
 
 if __name__ == "__main__":
