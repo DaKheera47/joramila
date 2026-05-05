@@ -9,6 +9,7 @@ Images are downloaded into `alkaram/images/`.
 Products are stored in `alkaram/products.sqlite3`.
 OpenCLIP embeddings are generated per product image and stored in a `sqlite-vec` virtual table inside that database.
 Product text embeddings are stored separately for optional reranking.
+Re-imports skip unchanged products by comparing a stored content hash and existing image embedding counts.
 The first OpenCLIP run may download model weights.
 
 Run the tiny demo UI with:

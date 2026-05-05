@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 from .models import Product
 
@@ -19,6 +20,26 @@ class ProductDatabase:
 
 	def close(self) -> None:
 		self.connection.close()
+
+	def get_product_import_states(self) -> dict[int, dict[str, Any]]:
+		rows = self.connection.execute(
+			"""
+			SELECT
+				p.id,
+				p.content_hash,
+				(SELECT COUNT(*) FROM product_images AS pi WHERE pi.product_id = p.id) AS image_count,
+				(SELECT COUNT(*) FROM product_image_embeddings AS pie WHERE pie.product_id = p.id) AS embedding_count
+			FROM products AS p
+			"""
+		).fetchall()
+		return {
+			row[0]: {
+				"content_hash": row[1],
+				"image_count": row[2],
+				"embedding_count": row[3],
+			}
+			for row in rows
+		}
 
 	def search_similar_products_by_image(
 		self,
@@ -100,9 +121,10 @@ class ProductDatabase:
 				currency,
 				category,
 				stitched_status,
-				text_embedding
+				text_embedding,
+				content_hash
 			)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(id) DO UPDATE SET
 				title = excluded.title,
 				brand = excluded.brand,
@@ -115,6 +137,7 @@ class ProductDatabase:
 				category = excluded.category,
 				stitched_status = excluded.stitched_status,
 				text_embedding = excluded.text_embedding,
+				content_hash = excluded.content_hash,
 				updated_at = CURRENT_TIMESTAMP
 			""",
 			(
@@ -130,6 +153,7 @@ class ProductDatabase:
 				product.category,
 				product.stitched_status,
 				json.dumps(product.text_embedding),
+				product.content_hash,
 			),
 		)
 
@@ -159,23 +183,24 @@ class ProductDatabase:
 					image.sort_order,
 				),
 			)
-			self.connection.execute(
-				"""
-				INSERT INTO product_image_embeddings (
-					image_id,
-					product_id,
-					sort_order,
-					embedding
+			if image.embedding:
+				self.connection.execute(
+					"""
+					INSERT INTO product_image_embeddings (
+						image_id,
+						product_id,
+						sort_order,
+						embedding
+					)
+					VALUES (?, ?, ?, ?)
+					""",
+					(
+						image.id,
+						image.product_id,
+						image.sort_order,
+						json.dumps(image.embedding),
+					),
 				)
-				VALUES (?, ?, ?, ?)
-				""",
-				(
-					image.id,
-					image.product_id,
-					image.sort_order,
-					json.dumps(image.embedding),
-				),
-			)
 
 		self.connection.commit()
 
@@ -210,10 +235,12 @@ class ProductDatabase:
 				category TEXT,
 				stitched_status TEXT,
 				text_embedding TEXT NOT NULL,
+				content_hash TEXT NOT NULL DEFAULT '',
 				updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 			)
 			"""
 		)
+		self._ensure_products_columns()
 		self.connection.execute(
 			"""
 			CREATE TABLE IF NOT EXISTS product_images (
@@ -258,3 +285,13 @@ class ProductDatabase:
 			)
 			"""
 		)
+
+	def _ensure_products_columns(self) -> None:
+		columns = {
+			row[1]
+			for row in self.connection.execute("PRAGMA table_info(products)").fetchall()
+		}
+		if "content_hash" not in columns:
+			self.connection.execute(
+				"ALTER TABLE products ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''"
+			)

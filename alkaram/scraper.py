@@ -59,14 +59,17 @@ class AlkaramScraper:
 
 		worker_count = max(1, min(max_workers, len(product_urls)))
 		processed = 0
+		saved = 0
+		skipped = 0
 		start_time = time.monotonic()
 		total = len(product_urls)
 		database = ProductDatabase(db_path=db_path, embedding_dimensions=self.embedder.dimensions)
+		existing_states = database.get_product_import_states()
 
 		try:
 			with ThreadPoolExecutor(max_workers=worker_count) as executor:
 				futures = {
-					executor.submit(self.build_product, product_url, output_dir): product_url
+					executor.submit(self.build_product, product_url, output_dir, existing_states): product_url
 					for product_url in product_urls
 				}
 				for completed, future in enumerate(as_completed(futures), start=1):
@@ -79,18 +82,26 @@ class AlkaramScraper:
 
 					try:
 						product = future.result()
-						product.text_embedding = self.embedder.embed_product_text(product)
-						image_embeddings = self.embedder.embed_product_images(product)
-						for image, embedding in zip(product.images, image_embeddings):
-							image.embedding = embedding
-						product.images = [image for image in product.images if image.embedding]
-						database.upsert_product(product)
+						if product.skip_db_write:
+							skipped += 1
+							status = (
+								f"skipped unchanged id={product.id} restored_files={product.restored_files} "
+								f"category={product.category or 'unknown'} "
+								f"stitched={product.stitched_status or 'unknown'}"
+							)
+						else:
+							product.text_embedding = self.embedder.embed_product_text(product)
+							image_embeddings = self.embedder.embed_product_images(product)
+							for image, embedding in zip(product.images, image_embeddings):
+								image.embedding = embedding
+							database.upsert_product(product)
+							saved += 1
+							status = (
+								f"saved id={product.id} image_embeddings={self._embedded_image_count(product)} "
+								f"category={product.category or 'unknown'} "
+								f"stitched={product.stitched_status or 'unknown'}"
+							)
 						processed += 1
-						status = (
-							f"saved id={product.id} image_embeddings={len(product.images)} "
-							f"category={product.category or 'unknown'} "
-							f"stitched={product.stitched_status or 'unknown'}"
-						)
 					except Exception as exc:
 						status = f"failed: {exc.__class__.__name__}"
 
@@ -106,9 +117,15 @@ class AlkaramScraper:
 		finally:
 			database.close()
 
+		print(f"Finished: processed={processed} saved={saved} skipped={skipped}")
 		return processed
 
-	def build_product(self, product_url: str, output_dir: Path = IMAGE_OUTPUT_DIR) -> Product:
+	def build_product(
+		self,
+		product_url: str,
+		output_dir: Path = IMAGE_OUTPUT_DIR,
+		existing_states: Optional[dict[int, dict[str, Any]]] = None,
+	) -> Product:
 		soup = self.soup(product_url)
 
 		try:
@@ -130,7 +147,7 @@ class AlkaramScraper:
 		currency = self._extract_currency(soup)
 		product_id = self._extract_product_id(product_data, product_url)
 		image_urls = self.extract_product_images(product_url, soup=soup, product_data=product_data)
-		local_image_urls = self.download_image_urls(handle, image_urls, output_dir=output_dir)
+		local_image_urls = self.plan_local_image_urls(handle, image_urls, output_dir=output_dir)
 		category = self._derive_category(handle, title)
 		stitched_status = self._derive_stitched_status(handle, title)
 		images = [
@@ -158,6 +175,16 @@ class AlkaramScraper:
 			category=category,
 			stitched_status=stitched_status,
 		)
+		product.content_hash = self._product_content_hash(product)
+
+		existing_state = (existing_states or {}).get(product_id)
+		expected_embedding_count = min(len(product.images), self.embedder.max_images)
+		if self._should_skip_product(product, existing_state, expected_embedding_count):
+			product.restored_files = self.ensure_local_images(handle, image_urls, output_dir=output_dir)
+			product.skip_db_write = True
+			return product
+
+		product.restored_files = self.ensure_local_images(handle, image_urls, output_dir=output_dir)
 		return product
 
 	def fetch(self, url: str) -> str:
@@ -237,26 +264,30 @@ class AlkaramScraper:
 
 		return images
 
-	def download_image_urls(self, handle: str, image_urls: list[str], output_dir: Path = IMAGE_OUTPUT_DIR) -> list[str]:
-		output_dir.mkdir(parents=True, exist_ok=True)
-
+	def plan_local_image_urls(self, handle: str, image_urls: list[str], output_dir: Path = IMAGE_OUTPUT_DIR) -> list[str]:
 		local_paths: list[str] = []
-		slug = self._slugify(handle)
 		for index, image_url in enumerate(image_urls, start=1):
-			extension = self._image_extension(image_url)
-			destination = output_dir / f"{slug}-{index:02d}{extension}"
-			if not destination.exists() or destination.stat().st_size <= 0:
-				response = self._session().get(image_url, impersonate="chrome124", timeout=60)
-				response.raise_for_status()
-				destination.write_bytes(response.content)
-
+			destination = self._image_destination(handle, index, image_url, output_dir)
 			try:
 				relative_path = destination.relative_to(PROJECT_ROOT)
 			except ValueError:
 				relative_path = destination
 			local_paths.append(relative_path.as_posix())
-
 		return local_paths
+
+	def ensure_local_images(self, handle: str, image_urls: list[str], output_dir: Path = IMAGE_OUTPUT_DIR) -> int:
+		output_dir.mkdir(parents=True, exist_ok=True)
+
+		restored_files = 0
+		for index, image_url in enumerate(image_urls, start=1):
+			destination = self._image_destination(handle, index, image_url, output_dir)
+			if not destination.exists() or destination.stat().st_size <= 0:
+				response = self._session().get(image_url, impersonate="chrome124", timeout=60)
+				response.raise_for_status()
+				destination.write_bytes(response.content)
+				restored_files += 1
+
+		return restored_files
 
 	def scrape(self, limit: int = 20, max_workers: int = 8) -> list[Product]:
 		if limit <= 0:
@@ -278,7 +309,6 @@ class AlkaramScraper:
 					image_embeddings = self.embedder.embed_product_images(product)
 					for image, embedding in zip(product.images, image_embeddings):
 						image.embedding = embedding
-					product.images = [image for image in product.images if image.embedding]
 					products_by_index[index] = product
 				except Exception:
 					continue
@@ -394,6 +424,12 @@ class AlkaramScraper:
 		return AlkaramScraper._normalize_image_url(best_url, base_url)
 
 	@staticmethod
+	def _image_destination(handle: str, index: int, image_url: str, output_dir: Path) -> Path:
+		slug = AlkaramScraper._slugify(handle)
+		extension = AlkaramScraper._image_extension(image_url)
+		return output_dir / f"{slug}-{index:02d}{extension}"
+
+	@staticmethod
 	def _slugify(value: str) -> str:
 		slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.lower()).strip("-")
 		return slug or "product"
@@ -463,6 +499,42 @@ class AlkaramScraper:
 			except ValueError:
 				return None
 		return None
+
+	@staticmethod
+	def _product_content_hash(product: Product) -> str:
+		payload = {
+			"id": product.id,
+			"title": product.title,
+			"brand": product.brand,
+			"seller": product.seller,
+			"product_url": product.product_url,
+			"image_urls": product.image_urls,
+			"local_image_urls": product.local_image_urls,
+			"price": product.price,
+			"currency": product.currency,
+			"category": product.category,
+			"stitched_status": product.stitched_status,
+		}
+		encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+		return hashlib.blake2b(encoded, digest_size=16).hexdigest()
+
+	@staticmethod
+	def _should_skip_product(
+		product: Product,
+		existing_state: Optional[dict[str, Any]],
+		expected_embedding_count: int,
+	) -> bool:
+		if not existing_state:
+			return False
+		return (
+			existing_state.get("content_hash") == product.content_hash
+			and existing_state.get("image_count") == len(product.images)
+			and existing_state.get("embedding_count") == expected_embedding_count
+		)
+
+	@staticmethod
+	def _embedded_image_count(product: Product) -> int:
+		return sum(1 for image in product.images if image.embedding)
 
 	@staticmethod
 	def _derive_category(handle: str, title: str) -> str:

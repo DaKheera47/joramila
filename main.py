@@ -43,7 +43,7 @@ def main() -> None:
 		max_workers=args.workers,
 		limit=args.limit,
 	)
-	print(f"Ingested {processed} products into {args.db}")
+	print(f"Processed {processed} products against {args.db}")
 
 
 if __name__ == "__main__":

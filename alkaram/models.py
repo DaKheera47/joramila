@@ -29,3 +29,6 @@ class Product:
 	category: Optional[str] = None
 	stitched_status: Optional[str] = None
 	text_embedding: list[float] = field(default_factory=list)
+	content_hash: str = ""
+	skip_db_write: bool = False
+	restored_files: int = 0
