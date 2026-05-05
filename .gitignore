@@ -35,6 +35,7 @@ pip-wheel-metadata/
 
 # Scraper output
 alkaram/images/
+alkaram/images-processed/
 alkaram/uploads/
 alkaram/*.db
 alkaram/*.sqlite

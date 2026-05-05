@@ -5,7 +5,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from .models import Product
+from .models import Product, ProductImage
 
 
 DATABASE_PATH = Path(__file__).resolve().parent / "products.sqlite3"
@@ -26,6 +26,17 @@ class ProductDatabase:
 			"""
 			SELECT
 				p.id,
+				p.title,
+				p.brand,
+				p.seller,
+				p.product_url,
+				p.image_urls,
+				p.local_image_urls,
+				p.price,
+				p.currency,
+				p.category,
+				p.stitched_status,
+				p.text_embedding,
 				p.content_hash,
 				(SELECT COUNT(*) FROM product_images AS pi WHERE pi.product_id = p.id) AS image_count,
 				(SELECT COUNT(*) FROM product_image_embeddings AS pie WHERE pie.product_id = p.id) AS embedding_count
@@ -34,12 +45,99 @@ class ProductDatabase:
 		).fetchall()
 		return {
 			row[0]: {
-				"content_hash": row[1],
-				"image_count": row[2],
-				"embedding_count": row[3],
+				"title": row[1],
+				"brand": row[2],
+				"seller": row[3],
+				"product_url": row[4],
+				"image_urls": json.loads(row[5]),
+				"local_image_urls": json.loads(row[6]),
+				"price": row[7],
+				"currency": row[8],
+				"category": row[9],
+				"stitched_status": row[10],
+				"text_embedding": json.loads(row[11]),
+				"content_hash": row[12],
+				"image_count": row[13],
+				"embedding_count": row[14],
 			}
 			for row in rows
 		}
+
+	def load_products(self, limit: int | None = None) -> list[Product]:
+		sql = """
+			SELECT
+				id,
+				title,
+				brand,
+				seller,
+				product_url,
+				image_urls,
+				local_image_urls,
+				price,
+				currency,
+				category,
+				stitched_status,
+				text_embedding,
+				content_hash
+			FROM products
+			ORDER BY id
+		"""
+		params: tuple[Any, ...] = ()
+		if limit is not None:
+			sql += " LIMIT ?"
+			params = (limit,)
+
+		products_by_id: dict[int, Product] = {}
+		for row in self.connection.execute(sql, params).fetchall():
+			products_by_id[row[0]] = Product(
+				id=row[0],
+				title=row[1],
+				brand=row[2],
+				seller=row[3],
+				product_url=row[4],
+				image_urls=json.loads(row[5]),
+				local_image_urls=json.loads(row[6]),
+				price=row[7],
+				currency=row[8],
+				category=row[9],
+				stitched_status=row[10],
+				text_embedding=json.loads(row[11]),
+				content_hash=row[12],
+			)
+
+		if not products_by_id:
+			return []
+
+		placeholders = ",".join("?" for _ in products_by_id)
+		image_rows = self.connection.execute(
+			f"""
+			SELECT
+				id,
+				product_id,
+				image_url,
+				local_image_url,
+				processed_image_url,
+				sort_order
+			FROM product_images
+			WHERE product_id IN ({placeholders})
+			ORDER BY product_id, sort_order
+			""",
+			tuple(products_by_id.keys()),
+		).fetchall()
+		for row in image_rows:
+			image = ProductImage(
+				id=row[0],
+				product_id=row[1],
+				image_url=row[2],
+				local_image_url=row[3],
+				processed_image_url=row[4],
+				sort_order=row[5],
+			)
+			products_by_id[row[1]].images.append(image)
+			if row[4]:
+				products_by_id[row[1]].processed_image_urls.append(row[4])
+
+		return list(products_by_id.values())
 
 	def search_similar_products_by_image(
 		self,
@@ -171,15 +269,17 @@ class ProductDatabase:
 					product_id,
 					image_url,
 					local_image_url,
+					processed_image_url,
 					sort_order
 				)
-				VALUES (?, ?, ?, ?, ?)
+				VALUES (?, ?, ?, ?, ?, ?)
 				""",
 				(
 					image.id,
 					image.product_id,
 					image.image_url,
 					image.local_image_url,
+					image.processed_image_url,
 					image.sort_order,
 				),
 			)
@@ -248,11 +348,13 @@ class ProductDatabase:
 				product_id INTEGER NOT NULL,
 				image_url TEXT NOT NULL,
 				local_image_url TEXT NOT NULL,
+				processed_image_url TEXT NOT NULL DEFAULT '',
 				sort_order INTEGER NOT NULL,
 				FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
 			)
 			"""
 		)
+		self._ensure_product_images_columns()
 		self._ensure_image_embeddings_table()
 		self.connection.execute(
 			"CREATE INDEX IF NOT EXISTS idx_products_category ON products(category)"
@@ -294,4 +396,14 @@ class ProductDatabase:
 		if "content_hash" not in columns:
 			self.connection.execute(
 				"ALTER TABLE products ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''"
+			)
+
+	def _ensure_product_images_columns(self) -> None:
+		columns = {
+			row[1]
+			for row in self.connection.execute("PRAGMA table_info(product_images)").fetchall()
+		}
+		if "processed_image_url" not in columns:
+			self.connection.execute(
+				"ALTER TABLE product_images ADD COLUMN processed_image_url TEXT NOT NULL DEFAULT ''"
 			)

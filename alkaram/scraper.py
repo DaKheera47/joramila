@@ -16,6 +16,7 @@ from curl_cffi import requests
 
 from .database import DATABASE_PATH, ProductDatabase
 from .embeddings import ProductEmbedder
+from .image_processing import PROCESSED_IMAGE_OUTPUT_DIR, ProductImagePreprocessor
 from .models import Product, ProductImage
 
 
@@ -30,6 +31,7 @@ class AlkaramScraper:
 		self.base_url = base_url.rstrip("/") + "/"
 		self.brand = brand
 		self.embedder = ProductEmbedder(project_root=PROJECT_ROOT)
+		self.preprocessor = ProductImagePreprocessor(project_root=PROJECT_ROOT)
 		self._thread_local = threading.local()
 		self._base_headers = {
 			"User-Agent": (
@@ -120,6 +122,54 @@ class AlkaramScraper:
 		print(f"Finished: processed={processed} saved={saved} skipped={skipped}")
 		return processed
 
+	def reembed_existing_products(
+		self,
+		db_path: Path = DATABASE_PATH,
+		limit: Optional[int] = None,
+	) -> int:
+		database = ProductDatabase(db_path=db_path, embedding_dimensions=self.embedder.dimensions)
+		products = database.load_products(limit=limit)
+		if not products:
+			database.close()
+			return 0
+
+		processed = 0
+		start_time = time.monotonic()
+		total = len(products)
+		try:
+			for index, product in enumerate(products, start=1):
+				elapsed = max(time.monotonic() - start_time, 0.001)
+				avg_seconds = elapsed / index
+				remaining = total - index
+				eta_seconds = avg_seconds * remaining
+				per_second = index / elapsed
+
+				try:
+					self._prepare_processed_images(product)
+					product.text_embedding = self.embedder.embed_product_text(product)
+					image_embeddings = self.embedder.embed_product_images(product)
+					for image, embedding in zip(product.images, image_embeddings):
+						image.embedding = embedding
+					database.upsert_product(product)
+					processed += 1
+					status = f"reembedded id={product.id} image_embeddings={self._embedded_image_count(product)}"
+				except Exception as exc:
+					status = f"failed: {exc.__class__.__name__}"
+
+				print(
+					(
+						f"[{index}/{total}] left={remaining} "
+						f"eta={self._format_duration(eta_seconds)} "
+						f"avg={self._format_duration(avg_seconds)} "
+						f"rate={per_second:.2f}/s "
+						f"{status} {product.product_url}"
+					)
+				)
+		finally:
+			database.close()
+
+		return processed
+
 	def build_product(
 		self,
 		product_url: str,
@@ -148,6 +198,7 @@ class AlkaramScraper:
 		product_id = self._extract_product_id(product_data, product_url)
 		image_urls = self.extract_product_images(product_url, soup=soup, product_data=product_data)
 		local_image_urls = self.plan_local_image_urls(handle, image_urls, output_dir=output_dir)
+		processed_image_urls = self.plan_processed_image_urls(local_image_urls)
 		category = self._derive_category(handle, title)
 		stitched_status = self._derive_stitched_status(handle, title)
 		images = [
@@ -156,9 +207,13 @@ class AlkaramScraper:
 				product_id=product_id,
 				image_url=image_url,
 				local_image_url=local_image_url,
+				processed_image_url=processed_image_url,
 				sort_order=index,
 			)
-			for index, (image_url, local_image_url) in enumerate(zip(image_urls, local_image_urls), start=1)
+			for index, (image_url, local_image_url, processed_image_url) in enumerate(
+				zip(image_urls, local_image_urls, processed_image_urls),
+				start=1,
+			)
 		]
 
 		product = Product(
@@ -169,6 +224,7 @@ class AlkaramScraper:
 			product_url=product_url,
 			image_urls=image_urls,
 			local_image_urls=local_image_urls,
+			processed_image_urls=processed_image_urls,
 			images=images,
 			price=price,
 			currency=currency,
@@ -181,10 +237,12 @@ class AlkaramScraper:
 		expected_embedding_count = min(len(product.images), self.embedder.max_images)
 		if self._should_skip_product(product, existing_state, expected_embedding_count):
 			product.restored_files = self.ensure_local_images(handle, image_urls, output_dir=output_dir)
+			self._prepare_processed_images(product)
 			product.skip_db_write = True
 			return product
 
 		product.restored_files = self.ensure_local_images(handle, image_urls, output_dir=output_dir)
+		self._prepare_processed_images(product)
 		return product
 
 	def fetch(self, url: str) -> str:
@@ -275,6 +333,12 @@ class AlkaramScraper:
 			local_paths.append(relative_path.as_posix())
 		return local_paths
 
+	def plan_processed_image_urls(self, local_image_urls: list[str]) -> list[str]:
+		return [
+			self.preprocessor.planned_relative_path(local_image_url)
+			for local_image_url in local_image_urls
+		]
+
 	def ensure_local_images(self, handle: str, image_urls: list[str], output_dir: Path = IMAGE_OUTPUT_DIR) -> int:
 		output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -288,6 +352,11 @@ class AlkaramScraper:
 				restored_files += 1
 
 		return restored_files
+
+	def _prepare_processed_images(self, product: Product) -> None:
+		product.processed_image_urls = self.preprocessor.preprocess_many(product.local_image_urls)
+		for image, processed_image_url in zip(product.images, product.processed_image_urls):
+			image.processed_image_url = processed_image_url
 
 	def scrape(self, limit: int = 20, max_workers: int = 8) -> list[Product]:
 		if limit <= 0:
@@ -325,6 +394,7 @@ class AlkaramScraper:
 					"productUrl": product.product_url,
 					"imagesUrl": product.image_urls,
 					"localImagesUrl": product.local_image_urls,
+					"processedImagesUrl": product.processed_image_urls,
 					"price": product.price,
 					"currency": product.currency,
 					"category": product.category,
@@ -335,6 +405,7 @@ class AlkaramScraper:
 							"id": image.id,
 							"imageUrl": image.image_url,
 							"localImageUrl": image.local_image_url,
+							"processedImageUrl": image.processed_image_url,
 							"sortOrder": image.sort_order,
 							"embedding": image.embedding,
 						}

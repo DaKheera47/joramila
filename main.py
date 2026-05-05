@@ -27,23 +27,39 @@ def parse_args() -> argparse.Namespace:
 		default=DATABASE_PATH,
 		help="SQLite database path.",
 	)
+	parser.add_argument(
+		"--reembed-existing",
+		action="store_true",
+		help="Rebuild processed images and embeddings from already-downloaded local files in the database.",
+	)
 	return parser.parse_args()
 
 
 def main() -> None:
 	args = parse_args()
 	scraper = AlkaramScraper()
-	print(
-		f"Starting ingest: limit={args.limit if args.limit is not None else 'all'} "
-		f"workers={args.workers} db={args.db}"
-	)
-	processed = scraper.ingest_products(
-		db_path=args.db,
-		output_dir=IMAGE_OUTPUT_DIR,
-		max_workers=args.workers,
-		limit=args.limit,
-	)
-	print(f"Processed {processed} products against {args.db}")
+	if args.reembed_existing:
+		print(
+			f"Starting local re-embed: limit={args.limit if args.limit is not None else 'all'} "
+			f"db={args.db}"
+		)
+		processed = scraper.reembed_existing_products(
+			db_path=args.db,
+			limit=args.limit,
+		)
+		print(f"Re-embedded {processed} products in {args.db}")
+	else:
+		print(
+			f"Starting ingest: limit={args.limit if args.limit is not None else 'all'} "
+			f"workers={args.workers} db={args.db}"
+		)
+		processed = scraper.ingest_products(
+			db_path=args.db,
+			output_dir=IMAGE_OUTPUT_DIR,
+			max_workers=args.workers,
+			limit=args.limit,
+		)
+		print(f"Processed {processed} products against {args.db}")
 
 
 if __name__ == "__main__":

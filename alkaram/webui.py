@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .database import DATABASE_PATH, ProductDatabase
 from .embeddings import ProductEmbedder
+from .image_processing import ProductImagePreprocessor
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -21,6 +22,7 @@ MAX_RESULTS = 12
 app = FastAPI(title="JoraMila Demo")
 app.mount("/files", StaticFiles(directory=PROJECT_ROOT), name="files")
 _EMBEDDER: ProductEmbedder | None = None
+_PREPROCESSOR: ProductImagePreprocessor | None = None
 
 
 def _page(body: str) -> HTMLResponse:
@@ -160,6 +162,13 @@ def _get_embedder() -> ProductEmbedder:
 	return _EMBEDDER
 
 
+def _get_preprocessor() -> ProductImagePreprocessor:
+	global _PREPROCESSOR
+	if _PREPROCESSOR is None:
+		_PREPROCESSOR = ProductImagePreprocessor(project_root=PROJECT_ROOT)
+	return _PREPROCESSOR
+
+
 @app.get("/", response_class=HTMLResponse)
 def home() -> HTMLResponse:
 	if not DATABASE_PATH.exists():
@@ -174,9 +183,11 @@ def search(file: UploadFile = File(...)) -> HTMLResponse:
 
 	upload_path = _save_upload(file)
 	embedder = _get_embedder()
+	preprocessor = _get_preprocessor()
 	database = ProductDatabase(db_path=DATABASE_PATH, embedding_dimensions=embedder.dimensions)
 	try:
-		embedding = embedder.embed_image_path(upload_path)
+		processed_upload_path = preprocessor.preprocess_relative_path(upload_path)
+		embedding = embedder.embed_image_path(processed_upload_path)
 		results = database.search_similar_products_by_image(embedding, limit=MAX_RESULTS)
 	finally:
 		database.close()

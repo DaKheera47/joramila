@@ -55,9 +55,10 @@ class ProductEmbedder:
 
 	def embed_product_images(self, product: Product) -> list[list[float]]:
 		embeddings: list[list[float]] = []
-		for local_path in product.local_image_urls[: self.max_images]:
+		for image in product.images[: self.max_images]:
+			image_path = image.processed_image_url or image.local_image_url
 			try:
-				embeddings.append(self.embed_image_path(local_path))
+				embeddings.append(self.embed_image_path(image_path))
 			except Exception:
 				continue
 		return embeddings

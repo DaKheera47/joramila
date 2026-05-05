@@ -11,6 +11,7 @@ class ProductImage:
 	image_url: str
 	local_image_url: str
 	sort_order: int
+	processed_image_url: str = ""
 	embedding: list[float] = field(default_factory=list)
 
 
@@ -23,6 +24,7 @@ class Product:
 	product_url: str
 	image_urls: list[str] = field(default_factory=list)
 	local_image_urls: list[str] = field(default_factory=list)
+	processed_image_urls: list[str] = field(default_factory=list)
 	images: list[ProductImage] = field(default_factory=list)
 	price: Optional[float] = None
 	currency: Optional[str] = None
