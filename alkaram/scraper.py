@@ -126,6 +126,8 @@ class AlkaramScraper:
 		self,
 		db_path: Path = DATABASE_PATH,
 		limit: Optional[int] = None,
+		max_workers: int = 8,
+		recompute_text_embeddings: bool = False,
 	) -> int:
 		database = ProductDatabase(db_path=db_path, embedding_dimensions=self.embedder.dimensions)
 		products = database.load_products(limit=limit)
@@ -133,38 +135,46 @@ class AlkaramScraper:
 			database.close()
 			return 0
 
+		worker_count = max(1, min(max_workers, len(products)))
 		processed = 0
 		start_time = time.monotonic()
 		total = len(products)
 		try:
-			for index, product in enumerate(products, start=1):
-				elapsed = max(time.monotonic() - start_time, 0.001)
-				avg_seconds = elapsed / index
-				remaining = total - index
-				eta_seconds = avg_seconds * remaining
-				per_second = index / elapsed
+			with ThreadPoolExecutor(max_workers=worker_count) as executor:
+				futures = {
+					executor.submit(self._prepare_processed_images, product): product
+					for product in products
+				}
+				for index, future in enumerate(as_completed(futures), start=1):
+					product = futures[future]
+					elapsed = max(time.monotonic() - start_time, 0.001)
+					avg_seconds = elapsed / index
+					remaining = total - index
+					eta_seconds = avg_seconds * remaining
+					per_second = index / elapsed
 
-				try:
-					self._prepare_processed_images(product)
-					product.text_embedding = self.embedder.embed_product_text(product)
-					image_embeddings = self.embedder.embed_product_images(product)
-					for image, embedding in zip(product.images, image_embeddings):
-						image.embedding = embedding
-					database.upsert_product(product)
-					processed += 1
-					status = f"reembedded id={product.id} image_embeddings={self._embedded_image_count(product)}"
-				except Exception as exc:
-					status = f"failed: {exc.__class__.__name__}"
+					try:
+						future.result()
+						if recompute_text_embeddings:
+							product.text_embedding = self.embedder.embed_product_text(product)
+						image_embeddings = self.embedder.embed_product_images(product)
+						for image, embedding in zip(product.images, image_embeddings):
+							image.embedding = embedding
+						database.upsert_product(product)
+						processed += 1
+						status = f"reembedded id={product.id} image_embeddings={self._embedded_image_count(product)}"
+					except Exception as exc:
+						status = f"failed: {exc.__class__.__name__}"
 
-				print(
-					(
-						f"[{index}/{total}] left={remaining} "
-						f"eta={self._format_duration(eta_seconds)} "
-						f"avg={self._format_duration(avg_seconds)} "
-						f"rate={per_second:.2f}/s "
-						f"{status} {product.product_url}"
+					print(
+						(
+							f"[{index}/{total}] left={remaining} "
+							f"eta={self._format_duration(eta_seconds)} "
+							f"avg={self._format_duration(avg_seconds)} "
+							f"rate={per_second:.2f}/s "
+							f"{status} {product.product_url}"
+						)
 					)
-				)
 		finally:
 			database.close()
 

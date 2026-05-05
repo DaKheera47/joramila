@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import os
 import subprocess
 import tempfile
 
@@ -38,7 +40,12 @@ class ProductImagePreprocessor:
 		return self._relative_to_project_root(destination)
 
 	def preprocess_many(self, image_paths: list[str | Path]) -> list[str]:
-		return [self.preprocess_relative_path(path) for path in image_paths]
+		if not image_paths:
+			return []
+		self._ensure_background_remover_binary()
+		worker_count = max(1, min(len(image_paths), os.cpu_count() or 1))
+		with ThreadPoolExecutor(max_workers=worker_count) as executor:
+			return list(executor.map(self.preprocess_relative_path, image_paths))
 
 	def _planned_destination(self, source_path: Path) -> Path:
 		return self.output_dir / f"{source_path.stem}.webp"

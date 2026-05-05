@@ -46,6 +46,7 @@ def main() -> None:
 		processed = scraper.reembed_existing_products(
 			db_path=args.db,
 			limit=args.limit,
+			max_workers=args.workers,
 		)
 		print(f"Re-embedded {processed} products in {args.db}")
 	else:

@@ -54,14 +54,11 @@ class ProductEmbedder:
 		return self.embed_text(text)
 
 	def embed_product_images(self, product: Product) -> list[list[float]]:
-		embeddings: list[list[float]] = []
-		for image in product.images[: self.max_images]:
-			image_path = image.processed_image_url or image.local_image_url
-			try:
-				embeddings.append(self.embed_image_path(image_path))
-			except Exception:
-				continue
-		return embeddings
+		image_paths = [
+			image.processed_image_url or image.local_image_url
+			for image in product.images[: self.max_images]
+		]
+		return self.embed_image_paths(image_paths)
 
 	def embed_text(self, text: str) -> list[float]:
 		normalized = text.strip()
@@ -74,18 +71,30 @@ class ProductEmbedder:
 		return self._tensor_to_unit_list(features[0])
 
 	def embed_image_path(self, image_path: str | Path) -> list[float]:
-		path = Path(image_path)
-		if not path.is_absolute():
-			if self.project_root is None:
-				raise ValueError("project_root is required for relative image paths")
-			path = self.project_root / path
+		embeddings = self.embed_image_paths([image_path])
+		if not embeddings:
+			raise ValueError(f"failed to embed image: {image_path}")
+		return embeddings[0]
 
-		with Image.open(path) as image:
-			tensor = self.preprocess(image.convert("RGB")).unsqueeze(0).to(self.device)
+	def embed_image_paths(self, image_paths: list[str | Path]) -> list[list[float]]:
+		if not image_paths:
+			return []
 
+		tensors: list[torch.Tensor] = []
+		for image_path in image_paths:
+			path = Path(image_path)
+			if not path.is_absolute():
+				if self.project_root is None:
+					raise ValueError("project_root is required for relative image paths")
+				path = self.project_root / path
+
+			with Image.open(path) as image:
+				tensors.append(self.preprocess(image.convert("RGB")))
+
+		batch = torch.stack(tensors).to(self.device)
 		with torch.no_grad():
-			features = self.model.encode_image(tensor)
-		return self._tensor_to_unit_list(features[0])
+			features = self.model.encode_image(batch)
+		return [self._tensor_to_unit_list(feature) for feature in features]
 
 	def _infer_dimensions(self) -> int:
 		projection = getattr(self.model, "text_projection", None)

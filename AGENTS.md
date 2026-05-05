@@ -70,6 +70,7 @@ uv run python main.py --reembed-existing
 ```
 
 Use that command after changing preprocessing or embedding behavior.
+`--workers` should be used to parallelize the preprocessing side of this rebuild flow.
 
 Run the demo UI:
 

@@ -21,6 +21,7 @@ uv run python main.py --reembed-existing
 ```
 
 Use that command after changing background-removal or embedding logic.
+It now uses `--workers` for parallel image preprocessing.
 
 Run the tiny demo UI with:
 
