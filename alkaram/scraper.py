@@ -221,8 +221,15 @@ class AlkaramScraper:
 
 		return downloaded
 
-	def download_all_images(self, output_dir: Path = IMAGE_OUTPUT_DIR, max_workers: int = 8) -> list[Path]:
+	def download_all_images(
+		self,
+		output_dir: Path = IMAGE_OUTPUT_DIR,
+		max_workers: int = 8,
+		limit: Optional[int] = None,
+	) -> list[Path]:
 		product_urls = self.fetch_sitemap_product_links()
+		if limit is not None:
+			product_urls = product_urls[: max(0, limit)]
 		if not product_urls:
 			return []
 
