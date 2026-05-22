@@ -6,6 +6,8 @@ An end-to-end **e-commerce visual search pipeline** that scrapes retail storefro
 
 Rather than just fetching data, JoraMila is designed as a decoupled architecture for turning raw retail catalog structures into searchable local vector databases.
 
+![JoraMila UI Screenshot](assets/webui_screenshot.png)
+
 ---
 
 ## Architecture
