@@ -2,16 +2,16 @@
 
 ## Purpose
 
-This repo ingests Alkaram product data into a local SQLite catalog for image-first retrieval.
+This repo implements JoraMila, an end-to-end e-commerce visual search pipeline that crawls retail sitemaps, extracts catalog metadata and images, removes backgrounds, generates high-dimensional embeddings, and indexes them in a local SQLite catalog with a query frontend.
 
 Core flow:
-- scrape product URLs from the sitemap
-- download product images to `alkaram/images/`
-- derive background-removed WebP images in `alkaram/images-processed/`
-- generate OpenCLIP embeddings per product image
-- store product metadata in SQLite
-- store image embeddings in `sqlite-vec`
-- expose a tiny FastAPI demo UI for screenshot-to-product search
+- Scrape product URLs from configured store sitemaps (using Alkaram as the default target)
+- Download raw product images to `alkaram/images/`
+- Derive background-removed WebP images in `alkaram/images-processed/`
+- Generate OpenCLIP embeddings per product image
+- Store product metadata in SQLite
+- Store image embeddings in `sqlite-vec`
+- Expose a FastAPI search UI for screenshot-to-product visual retrieval
 
 ## Key Files
 
